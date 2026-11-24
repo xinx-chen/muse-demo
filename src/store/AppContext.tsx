@@ -2,6 +2,7 @@ import { createContext, useContext, useMemo, useState, type ReactNode } from 're
 import type { ChatSession, MemoryEntry, MemoryCategory, Message, Note, NoteFormat, View } from '@/types';
 import { MOCK_MEMORIES, MOCK_NOTES, MOCK_SESSIONS } from '@/data/mock';
 import { generateId } from '@/lib/mockApi';
+import { buildSystemPrompt, callDeepSeekStream } from '@/lib/api';
 
 interface AppState {
   view: View;
@@ -70,39 +71,6 @@ function mockTag(content: string): string[] {
 function mockSummary(content: string): string {
   const plain = content.replace(/[#*>\-`]/g, ' ').replace(/\s+/g, ' ').trim();
   return plain.slice(0, 80) + (plain.length > 80 ? '...' : '');
-}
-
-function mockAiReply(content: string, memories: MemoryEntry[], notes: Note[]): { thinking: string; answer: string } {
-  const relevantPrefs = memories.filter((m) => m.category === 'preference');
-  const relatedNotes = notes
-    .filter((n) => {
-      const t = content.toLowerCase();
-      return n.tags.some((tag) => content.includes(tag)) || n.content.toLowerCase().slice(0, 50).split(' ').some((w) => t.includes(w));
-    })
-    .slice(0, 2);
-
-  const prefHint = relevantPrefs.length
-    ? `（用户偏好：${relevantPrefs.map((p) => p.content).join('；')}）`
-    : '';
-
-  const thinking = `分析用户输入 "${content.slice(0, 40)}"${prefHint}\n${
-    relatedNotes.length ? `发现 ${relatedNotes.length} 条相关笔记可以引用` : '暂无直接相关笔记'
-  }\n决定给出简洁、可执行的建议。`;
-
-  let answer = '';
-  if (content.includes('你是谁') || content.includes('你能做什么')) {
-    answer =
-      '我是你的 **Muse 第二大脑** 🧠\n\n我可以：\n\n📝 **捕获想法** — 随手记，自动整理成结构化笔记\n🔗 **连接记忆** — 帮你发现想法之间的关系\n💬 **记住你** — 你的偏好、习惯、项目我都记着\n🗺️ **知识图谱** — 可视化你积累的内容\n\n直接告诉我你在想什么就行～';
-  } else if (content.includes('记住') || content.includes('记一下')) {
-    const extracted = content.replace(/^(帮我|请|记住|记一下)/g, '').trim();
-    answer = `好的，我已经帮你记下了 ✨\n\n**"${extracted}"**\n\n这会成为你的一条记忆。以后相关的问题我会自动参考它。`;
-  } else if (relatedNotes.length) {
-    const refs = relatedNotes.map((n) => `  - 《${n.title}》（#${n.tags.join(' #')}）`).join('\n');
-    answer = `我想到你之前记过这些相关笔记 📚\n\n${refs}\n\n关于"${content}"——结合你的现有知识，我的建议是：先从其中最相关的一条开始回顾，然后决定要深入还是拓展。需要我帮你把这几个想法连接起来吗？${prefHint}\n\n（另外：我可以把这个对话也捕获成一条笔记 ✍️）`;
-  } else {
-    answer = `收到！让我想想...${prefHint}\n\n建议你把这个想法也**捕获**下来——记得越多，Muse 越懂你 🧠\n\n直接点左边"速记"或在笔记页随手写就行。`;
-  }
-  return { thinking, answer };
 }
 
 // ---------- Provider ----------
@@ -220,73 +188,139 @@ export function AppProvider({ children }: { children: ReactNode }) {
       content,
       createdAt: Date.now(),
     };
+    const agentMsgId = generateId();
 
+    // 先插入 userMsg + 空的 agent 占位消息
     setSessions((prev) =>
       prev.map((s) => {
         if (s.id !== activeSessionId) return s;
         const firstUserMsg = s.messages.find((m) => m.role === 'user');
         return {
           ...s,
-          title: firstUserMsg ? s.title : (content.slice(0, 24) ?? '新对话'),
-          messages: [...s.messages, userMsg],
+          title: firstUserMsg ? s.title : content.slice(0, 24),
+          messages: [
+            ...s.messages,
+            userMsg,
+            {
+              id: agentMsgId,
+              role: 'agent',
+              content: '', // 流式填充
+              thinking: '',
+              createdAt: Date.now(),
+            },
+          ],
           updatedAt: Date.now(),
         };
       }),
     );
 
     setIsThinking(true);
-    await new Promise((r) => setTimeout(r, 800 + Math.random() * 500));
 
-    const { thinking, answer } = mockAiReply(content, memories, notes);
+    // 构建 system prompt + api messages（同之前逻辑）
+    const relatedNotes = notes
+      .filter((n) => {
+        const t = content.toLowerCase();
+        return (
+          n.tags.some((tag) => content.includes(tag)) ||
+          n.title.toLowerCase().includes(t.slice(0, 6)) ||
+          n.content.toLowerCase().includes(t.slice(0, 10))
+        );
+      })
+      .slice(0, 3);
 
-    setSessions((prev) =>
-      prev.map((s) =>
-        s.id === activeSessionId
-          ? {
-              ...s,
-              messages: [
-                ...s.messages,
-                {
-                  id: generateId(),
-                  role: 'agent',
-                  content: answer,
-                  createdAt: Date.now(),
-                  thinking,
-                },
-              ],
-              updatedAt: Date.now(),
-            }
-          : s,
-      ),
-    );
+    const systemPrompt = buildSystemPrompt({
+      memories: memories.map((m) => ({ category: m.category, content: m.content, importance: m.importance })),
+      relatedNotes: relatedNotes.map((n) => ({ title: n.title, tags: n.tags, summary: n.summary })),
+    });
 
-    // 自动从对话里抽取一条记忆（简化版：含"我喜欢" / "我通常" 的句子）
-    const patterns: Array<[RegExp, MemoryCategory]> = [
-      [/我(?:喜欢|偏好|习惯).+/, 'preference'],
-      [/我(?:通常|一般|总是).+/, 'habit'],
-      [/我(?:在做|正在做|做).+项目/, 'project'],
+    const apiMessages = [
+      { role: 'system' as const, content: systemPrompt },
+      ...session.messages.map((m) => ({
+        role: (m.role === 'agent' ? 'assistant' : 'user') as 'user' | 'assistant',
+        content: m.content,
+      })),
+      { role: 'user' as const, content },
     ];
-    for (const [re, cat] of patterns) {
-      const match = content.match(re);
-      if (match) {
-        const extracted = match[0];
-        const exists = memories.some((m) => m.content === extracted);
-        if (!exists) {
-          const newMem: MemoryEntry = {
-            id: generateId(),
-            category: cat,
-            content: extracted,
-            source: `chat-${activeSessionId}`,
-            createdAt: Date.now(),
-            importance: cat === 'project' ? 5 : 3,
-          };
-          setMemories((prev) => [newMem, ...prev]);
-        }
-        break;
-      }
-    }
 
-    setIsThinking(false);
+    // 流式回调
+    callDeepSeekStream(apiMessages, {
+      onThinkingChunk: (chunk) => {
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === activeSessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === agentMsgId ? { ...m, thinking: (m.thinking ?? '') + chunk } : m,
+                  ),
+                }
+              : s,
+          ),
+        );
+      },
+      onContentChunk: (chunk) => {
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === activeSessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === agentMsgId ? { ...m, content: m.content + chunk } : m,
+                  ),
+                }
+              : s,
+          ),
+        );
+      },
+      onDone: (result) => {
+        setSessions((prev) =>
+          prev.map((s) =>
+            s.id === activeSessionId
+              ? {
+                  ...s,
+                  messages: s.messages.map((m) =>
+                    m.id === agentMsgId
+                      ? { ...m, content: result.content, thinking: result.thinking || undefined }
+                      : m,
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : s,
+          ),
+        );
+
+        // 自动抽取记忆
+        const patterns: Array<[RegExp, MemoryCategory]> = [
+          [/我(?:喜欢|偏好|习惯).+/, 'preference'],
+          [/我(?:通常|一般|总是).+/, 'habit'],
+          [/我(?:在做|正在做|做).+项目/, 'project'],
+        ];
+        for (const [re, cat] of patterns) {
+          const match = content.match(re);
+          if (match) {
+            const extracted = match[0];
+            const exists = memories.some((m) => m.content === extracted);
+            if (!exists) {
+              const newMem: MemoryEntry = {
+                id: generateId(),
+                category: cat,
+                content: extracted,
+                source: `chat-${activeSessionId}`,
+                createdAt: Date.now(),
+                importance: cat === 'project' ? 5 : 3,
+              };
+              setMemories((prev) => [newMem, ...prev]);
+            }
+            break;
+          }
+        }
+
+        setIsThinking(false);
+      },
+      onError: () => {
+        setIsThinking(false);
+      },
+    });
   };
 
   const deleteSession = (id: string) => {
